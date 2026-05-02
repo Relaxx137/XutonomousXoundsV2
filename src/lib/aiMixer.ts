@@ -379,6 +379,39 @@ function parseSafeJSON(text: string) {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const GEMINI_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
+let currentModelIndex = 0;
+
+async function generateContentWithCycle(ai: any, request: any): Promise<any> {
+  let attempts = 0;
+  while (attempts < GEMINI_MODELS.length) {
+    const model = GEMINI_MODELS[currentModelIndex];
+    currentModelIndex = (currentModelIndex + 1) % GEMINI_MODELS.length;
+    
+    try {
+      return await ai.models.generateContent({
+        ...request,
+        model
+      });
+    } catch (error: any) {
+      const errorMessage = error?.message || '';
+      if (error?.status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
+        console.warn(`Model ${model} hit rate limit (429). Cycling to next model...`);
+        attempts++;
+        if (attempts >= GEMINI_MODELS.length) {
+          throw error;
+        }
+        await delay(1000);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 export async function runAIAgentNetwork(
   vocalBlob: Blob,
   beatBlob: Blob,
@@ -393,7 +426,6 @@ export async function runAIAgentNetwork(
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const model = 'gemini-2.0-flash';
 
   try {
     let currentSettings: any = null;
@@ -510,8 +542,7 @@ Based on BOTH your listening AND the measurements above:
 
 Provide a detailed acoustic assessment with specific frequency recommendations.`;
 
-        const analysisResponse = await ai.models.generateContent({
-          model,
+        const analysisResponse = await generateContentWithCycle(ai, {
           contents: [{ text: analysisPrompt }, ...contents]
         });
 
@@ -565,8 +596,7 @@ Based on the spectral characteristics, dynamic range, frequency distribution, an
 
 Output JSON only.`;
 
-          const genreResponse = await ai.models.generateContent({
-            model,
+          const genreResponse = await generateContentWithCycle(ai, {
             contents: [{ text: genrePrompt }],
             config: {
               responseMimeType: "application/json",
@@ -662,8 +692,7 @@ CRITICAL RULES:
 
 Output JSON only.`;
 
-        const mixResponse = await ai.models.generateContent({
-          model,
+        const mixResponse = await generateContentWithCycle(ai, {
           contents: [{ text: mixPrompt }],
           config: {
             responseMimeType: "application/json",
@@ -757,8 +786,7 @@ Critique this mix based on BOTH your listening AND the measurements:
 Provide UPDATED settings to fix any remaining issues. Be specific about what you changed and why.
 Output JSON only.`;
 
-        const reviewResponse = await ai.models.generateContent({
-          model,
+        const reviewResponse = await generateContentWithCycle(ai, {
           contents: [{ text: reviewPrompt }, currentMixPart],
           config: {
             responseMimeType: "application/json",
@@ -768,7 +796,7 @@ Output JSON only.`;
 
         const updatedMix = parseSafeJSON(reviewResponse.text || "{}");
         const previousSettings = JSON.parse(JSON.stringify(currentSettings));
-        currentSettings = deepMergeSettings(defaultMixSettings, updatedMix.settings);
+        currentSettings = deepMergeSettings(currentSettings, updatedMix.settings);
         const paramDeltas = computeParameterDeltas(previousSettings, currentSettings);
 
         onProgress({
@@ -856,8 +884,7 @@ Your job is to ensure commercial-ready loudness, tonal balance, and stereo coher
 
 Output JSON only.`;
 
-    const masterResponse = await ai.models.generateContent({
-      model,
+    const masterResponse = await generateContentWithCycle(ai, {
       contents: [{ text: masterPrompt }],
       config: {
         responseMimeType: "application/json",
@@ -893,7 +920,7 @@ Output JSON only.`;
 
     const errorMessage = error?.message || '';
     if (error?.status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
-      throw new Error("API Quota Exceeded (429). The Gemini API rate limit was reached. Please try reducing the 'AI Iterations' slider to 1, or wait a minute before trying again. If you are on a free tier, you may have exhausted your daily quota.");
+      throw new Error("API Quota Exceeded (429). All available Gemini models hit rate limits. Please try reducing the 'AI Iterations' slider to 1, or wait a minute before trying again.");
     }
 
     throw error;
