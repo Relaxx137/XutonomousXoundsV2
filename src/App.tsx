@@ -117,7 +117,7 @@ export default function App() {
       });
       appendAiLog({
         agent: 'System',
-        message: 'AI Agent Network has successfully configured your mix settings.',
+        message: `AI Agent Network configured your mix settings — objective mix score ${result.finalScore}/100.`,
         details: result.matchedSkillId
           ? '✨ Session warm-started from Skill Tree — refined for your tracks.'
           : 'Rate this mix after processing to grow your Skill Tree.',

@@ -25,6 +25,12 @@ import {
   loadSkillTree,
   SkillMatchResult,
 } from './agentMemory';
+import {
+  scoreMix,
+  applyDspCorrections,
+  formatScoreLine,
+  MixScore,
+} from './mixScore';
 
 export type ConfidenceLevel = 'high' | 'medium' | 'low';
 
@@ -426,7 +432,7 @@ export async function runAIAgentNetwork(
   backupVocalBlob: Blob | null,
   iterations: number,
   onProgress: (log: AILog) => void
-): Promise<{ settings: MixSettings, reasoning: string, matchedSkillId: string | null, detectedGenre: string, vocalAnalysis: FullAudioAnalysis, beatAnalysis: FullAudioAnalysis }> {
+): Promise<{ settings: MixSettings, reasoning: string, matchedSkillId: string | null, detectedGenre: string, vocalAnalysis: FullAudioAnalysis, beatAnalysis: FullAudioAnalysis, finalScore: number }> {
 
   const apiKey = process.env.GEMINI_API_KEY || localStorage.getItem('gemini_api_key') || '';
   if (!apiKey) {
@@ -515,6 +521,11 @@ export async function runAIAgentNetwork(
     }
 
     let detectedGenre = 'hip-hop';
+
+    // Objective scoring state for the iteration loop (Phase 2 token-efficiency).
+    let lastMixScore: MixScore | null = null;
+    const EARLY_STOP_SCORE = 88;   // a mix this good needs no further passes
+    const MIN_IMPROVEMENT = 1.5;   // stop if a pass barely moves the needle
 
     for (let i = 1; i <= iterations; i++) {
       if (i === 1) {
@@ -740,38 +751,55 @@ Output JSON only.`;
 
       } else {
         // ═══════════════════════════════════════════════════════════════
-        // AGENT 4: Review Engineer (Iterative Refinement)
+        // AGENT 4: Review Engineer (Iterative Refinement) — score-driven
         // ═══════════════════════════════════════════════════════════════
         const reviewStartTime = Date.now();
         onProgress({
           agent: `Review Engineer (Pass ${i})`,
-          message: `Rendering current mix to analyze and refine...`,
+          message: `Rendering current mix to measure and refine...`,
           phase: 'review',
         });
 
-        // Render the current mix with current settings
+        // Render + analyze + score the current mix.
         const fullSettings: MixSettings = deepMergeSettings(defaultMixSettings, currentSettings);
         const currentMixBlob = await mixAudio(vocalBlob, beatBlob, backupVocalBlob, fullSettings);
-        const currentMixPart = await blobToGenerativePart(currentMixBlob);
-
-        // Analyze the rendered mix
         const mixBuffer = await decodeBlob(currentMixBlob);
         const mixAnalysis = analyzeAudio(mixBuffer);
         const mixAnalysisStr = formatAnalysis('CURRENT MIX', mixAnalysis);
+        const mixScore = scoreMix(mixAnalysis, detectedGenre);
 
         onProgress({
           agent: `Review Engineer (Pass ${i})`,
-          message: `Listening to rendered mix and analyzing results...`,
-          details: `Mix loudness: ${mixAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS, stereo width: ${(mixAnalysis.stereo.width * 100).toFixed(0)}%`
+          message: formatScoreLine(mixScore),
+          details: `Loudness ${mixAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS · crest ${mixAnalysis.loudness.crestFactor.toFixed(1)} dB · width ${(mixAnalysis.stereo.width * 100).toFixed(0)}%`,
+          phase: 'review',
         });
 
+        // ── Early stop: converged, or diminishing returns ──
+        const improvement = lastMixScore ? mixScore.score - lastMixScore.score : Infinity;
+        if (mixScore.score >= EARLY_STOP_SCORE || (lastMixScore && improvement < MIN_IMPROVEMENT)) {
+          onProgress({
+            agent: `Review Engineer (Pass ${i})`,
+            message: mixScore.score >= EARLY_STOP_SCORE
+              ? `Mix converged (${mixScore.score}/100) — stopping early to save passes.`
+              : `Diminishing returns (+${improvement.toFixed(1)} pts) — stopping early.`,
+            confidence: 'high',
+            phase: 'review',
+            durationMs: Date.now() - reviewStartTime,
+          });
+          lastMixScore = mixScore;
+          break;
+        }
+
+        // ── Deterministic DSP corrections (free — no LLM tokens) ──
+        const beforeCorrections = JSON.parse(JSON.stringify(currentSettings));
+        currentSettings = deepMergeSettings(currentSettings, applyDspCorrections(fullSettings, mixScore));
+
+        // ── LLM refinement: TEXT-ONLY (no audio re-upload) to cut token cost ──
         const reviewSchema = enforceRequired({
           type: "OBJECT",
           properties: {
-            settings: {
-              type: "OBJECT",
-              properties: mixSettingsSchemaProperties
-            },
+            settings: { type: "OBJECT", properties: mixSettingsSchemaProperties },
             reasoning: detailedReasoningSchema,
             critique: { type: "STRING", description: "Specific critique of the current mix and what was changed." },
             confidence: { type: "STRING", description: "Confidence in these refined settings: 'high', 'medium', or 'low'" },
@@ -780,40 +808,42 @@ Output JSON only.`;
 
         const targetLufs = GENRE_LUFS_TARGETS[detectedGenre] ?? -9;
         const lufsGap = targetLufs - mixAnalysis.loudness.estimatedLUFS;
-        const reviewPrompt = `You are a Senior Mix Engineer reviewing a rendered mix. Listen to the audio and compare it with the numerical measurements.
+        const weakest = Object.entries(mixScore.breakdown)
+          .sort((a, b) => a[1] - b[1]).slice(0, 2)
+          .map(([k, v]) => `${k} (${v}/100)`).join(', ');
+
+        const reviewPrompt = `You are a Senior Mix Engineer refining a mix from its OBJECTIVE MEASUREMENTS (no audio is provided this pass — reason from the numbers).
+
+═══ OBJECTIVE MIX SCORE ═══
+${formatScoreLine(mixScore)}
+Prioritise the weakest areas: ${weakest}
 
 ═══ CURRENT MIX MEASUREMENTS ═══
 ${mixAnalysisStr}
 
 ═══ LOUDNESS TARGET ═══
-Genre: ${detectedGenre.toUpperCase()}
-Target LUFS: ${targetLufs} LUFS
-Current LUFS: ${mixAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS
-Gap: ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB ${Math.abs(lufsGap) > 3 ? `⚠️ SIGNIFICANT — ${lufsGap > 0 ? 'increase masterGain' : 'decrease masterGain or reduce compression'}` : '✅ close to target'}
+Genre: ${detectedGenre.toUpperCase()}  ·  Target ${targetLufs} LUFS  ·  Current ${mixAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS  ·  Gap ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB
 
 ═══ ORIGINAL TRACK MEASUREMENTS ═══
 ${vocalAnalysisStr}
 ${beatAnalysisStr}
 
-═══ CURRENT SETTINGS ═══
+═══ CURRENT SETTINGS (deterministic auto-corrections already applied) ═══
 ${JSON.stringify(currentSettings, null, 2)}
 
 ═══ YOUR TASK ═══
-Critique this mix based on BOTH your listening AND the measurements:
+Improve the WEAKEST scoring areas first. Adjust only what the measurements justify:
+1. Loudness gap ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB → tune masterGain / lufsTarget.
+2. Dynamics: crest ${mixAnalysis.loudness.crestFactor.toFixed(1)} dB (aim 6–10 dB) → vocal compressor.
+3. Sibilance severity ${(mixAnalysis.sibilance.severity * 100).toFixed(0)}% → de-esser threshold/ratio.
+4. Stereo width ${(mixAnalysis.stereo.width * 100).toFixed(0)}% → stereoImaging.width.
+5. Vocal clarity vs beat: carve beat 2–4 kHz, set vocal presence.
 
-1. Vocal presence: Is the vocal clear and upfront, or buried? Check mid/presence energy vs beat.
-2. Frequency balance: Any mud (200–500 Hz on vocal)? Any harshness (3–5 kHz)?
-3. Dynamic control: Crest factor ${mixAnalysis.loudness.crestFactor.toFixed(1)} dB — target 6–10 dB for mastered music.
-4. Stereo field: Width ${(mixAnalysis.stereo.width * 100).toFixed(0)}% — appropriate for ${detectedGenre}?
-5. LOUDNESS: Gap is ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB from target. ${Math.abs(lufsGap) > 2 ? `Adjust masterGain to close this gap.` : `Loudness is close to target.`}
-6. De-essing: Is sibilance controlled without removing vocal presence?
-7. Spatial: Reverb/delay — does the vocal sit in front of the space?
-
-Provide UPDATED settings to fix any remaining issues. Be specific about what you changed and why.
+Provide UPDATED settings. Be specific about what you changed and why.
 Output JSON only.`;
 
         const reviewResponse = await generateContentWithCycle(ai, {
-          contents: [{ text: reviewPrompt }, currentMixPart],
+          contents: [{ text: reviewPrompt }],
           config: {
             responseMimeType: "application/json",
             responseSchema: reviewSchema as any,
@@ -821,14 +851,13 @@ Output JSON only.`;
         });
 
         const updatedMix = parseSafeJSON(reviewResponse.text || "{}");
-        const previousSettings = JSON.parse(JSON.stringify(currentSettings));
         currentSettings = deepMergeSettings(currentSettings, updatedMix.settings);
-        const paramDeltas = computeParameterDeltas(previousSettings, currentSettings);
+        const paramDeltas = computeParameterDeltas(beforeCorrections, currentSettings);
 
         onProgress({
           agent: `Review Engineer (Pass ${i})`,
-          message: `Mix refinement complete.`,
-          details: `Critique: ${updatedMix.critique}\nMastering: ${updatedMix.reasoning?.masteringReasoning || 'Adjusted'}`,
+          message: `Mix refinement complete (score was ${mixScore.score}/100).`,
+          details: `Critique: ${updatedMix.critique || '—'}`,
           confidence: (updatedMix.confidence as ConfidenceLevel) || 'medium',
           thoughtProcess: JSON.stringify(updatedMix.reasoning, null, 2),
           parameterDeltas: paramDeltas,
@@ -836,7 +865,8 @@ Output JSON only.`;
           durationMs: Date.now() - reviewStartTime,
         });
 
-        await delay(3000);
+        lastMixScore = mixScore;
+        await delay(2000);
       }
     }
 
@@ -860,11 +890,12 @@ Output JSON only.`;
     const preMasterAnalysisStr = formatAnalysis('PRE-MASTER MIX', preMasterAnalysis);
 
     const preMasterLufsGap = (GENRE_LUFS_TARGETS[detectedGenre] ?? -9) - preMasterAnalysis.loudness.estimatedLUFS;
+    const preMasterScore = scoreMix(preMasterAnalysis, detectedGenre);
 
     onProgress({
       agent: 'Mastering Engineer',
       message: 'Applying final mastering decisions...',
-      details: `Pre-master mix: ${preMasterAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS, crest ${preMasterAnalysis.loudness.crestFactor.toFixed(1)} dB, stereo ${(preMasterAnalysis.stereo.width * 100).toFixed(0)}%`,
+      details: `${formatScoreLine(preMasterScore)}\nPre-master mix: ${preMasterAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS, crest ${preMasterAnalysis.loudness.crestFactor.toFixed(1)} dB, stereo ${(preMasterAnalysis.stereo.width * 100).toFixed(0)}%`,
       phase: 'mastering',
     });
 
@@ -958,8 +989,9 @@ Output JSON only.`;
 
     onProgress({
       agent: 'Mastering Engineer',
-      message: 'Mastering and final approval complete.',
+      message: `Mastering and final approval complete. Final mix score: ${preMasterScore.score}/100.`,
       details: finalResult.masteringNotes,
+      confidence: preMasterScore.score >= 80 ? 'high' : preMasterScore.score >= 65 ? 'medium' : 'low',
       phase: 'mastering',
       durationMs: Date.now() - masterStartTime,
     });
@@ -974,6 +1006,7 @@ Output JSON only.`;
       detectedGenre,
       vocalAnalysis,
       beatAnalysis,
+      finalScore: preMasterScore.score,
     };
 
   } catch (error: any) {

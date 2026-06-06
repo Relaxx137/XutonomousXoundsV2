@@ -543,15 +543,117 @@ export function analyzeSpectralBalance(buffer: AudioBuffer): SpectralAnalysis {
 }
 
 /**
- * Measure loudness: peak, RMS, estimated LUFS, and crest factor.
+ * Integrated loudness per ITU-R BS.1770 (K-weighting + gating).
+ *
+ * Applies the two-stage K-weighting filter (a high-shelf "head" filter and an
+ * RLB high-pass) to each channel, sums channel mean-square energy, then applies
+ * the standard gated measurement (absolute -70 LUFS gate + relative -10 LU gate).
+ *
+ * This replaces the previous crude `rmsDB + offset` approximations (which used
+ * two different constants in different places), so the whole genre-LUFS targeting
+ * system now optimizes toward *actual* loudness.
+ */
+export function measureLUFS(channels: Float32Array[], sampleRate: number): number {
+  if (!channels.length || !channels[0].length) return -70;
+
+  // ── K-weighting filter coefficients (BS.1770), reference fs = 48 kHz ──
+  // Stage 1: high-shelf "head" filter. Stage 2: RLB high-pass.
+  // Coefficients are derived for the actual sample rate via bilinear pre-warping.
+  const makeHighShelf = (fs: number) => {
+    const f0 = 1681.974450955533;
+    const G = 3.999843853973347;
+    const Q = 0.7071752369554196;
+    const K = Math.tan((Math.PI * f0) / fs);
+    const Vh = Math.pow(10, G / 20);
+    const Vb = Math.pow(Vh, 0.4996667741545416);
+    const a0 = 1 + K / Q + K * K;
+    return {
+      b0: (Vh + (Vb * K) / Q + K * K) / a0,
+      b1: (2 * (K * K - Vh)) / a0,
+      b2: (Vh - (Vb * K) / Q + K * K) / a0,
+      a1: (2 * (K * K - 1)) / a0,
+      a2: (1 - K / Q + K * K) / a0,
+    };
+  };
+  const makeHighPass = (fs: number) => {
+    const f0 = 38.13547087602444;
+    const Q = 0.5003270373238773;
+    const K = Math.tan((Math.PI * f0) / fs);
+    const a0 = 1 + K / Q + K * K;
+    return {
+      b0: 1 / a0,
+      b1: -2 / a0,
+      b2: 1 / a0,
+      a1: (2 * (K * K - 1)) / a0,
+      a2: (1 - K / Q + K * K) / a0,
+    };
+  };
+
+  const hs = makeHighShelf(sampleRate);
+  const hp = makeHighPass(sampleRate);
+
+  const applyBiquad = (input: Float32Array, c: any): Float32Array => {
+    const out = new Float32Array(input.length);
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < input.length; i++) {
+      const x0 = input[i];
+      const y0 = c.b0 * x0 + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+      out[i] = y0;
+      x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+    }
+    return out;
+  };
+
+  // K-weight each channel
+  const weighted = channels.map(ch => applyBiquad(applyBiquad(ch, hs), hp));
+  const len = weighted[0].length;
+
+  // ── Gated loudness: 400ms blocks, 75% overlap (100ms hop) ──
+  const blockSize = Math.floor(0.4 * sampleRate);
+  const hop = Math.floor(0.1 * sampleRate);
+  if (len < blockSize) {
+    // Too short to gate — fall back to ungated K-weighted mean square
+    let ms = 0, n = 0;
+    for (const ch of weighted) for (let i = 0; i < ch.length; i++) { ms += ch[i] * ch[i]; n++; }
+    return n ? -0.691 + 10 * Math.log10(ms / n + 1e-12) : -70;
+  }
+
+  const blockLoudness: number[] = [];
+  for (let start = 0; start + blockSize <= len; start += hop) {
+    let ms = 0;
+    for (const ch of weighted) {
+      for (let i = start; i < start + blockSize; i++) ms += ch[i] * ch[i];
+    }
+    ms /= blockSize * weighted.length;
+    blockLoudness.push(-0.691 + 10 * Math.log10(ms + 1e-12));
+  }
+
+  // Absolute gate at -70 LUFS
+  const absGated = blockLoudness.filter(l => l > -70);
+  if (!absGated.length) return -70;
+
+  // Relative gate at (mean - 10 LU)
+  const meanEnergy = absGated.reduce((s, l) => s + Math.pow(10, l / 10), 0) / absGated.length;
+  const relThreshold = -0.691 + 10 * Math.log10(meanEnergy) - 10;
+  const relGated = blockLoudness.filter(l => l > relThreshold && l > -70);
+  if (!relGated.length) return -0.691 + 10 * Math.log10(meanEnergy);
+
+  const gatedEnergy = relGated.reduce((s, l) => s + Math.pow(10, l / 10), 0) / relGated.length;
+  return 10 * Math.log10(gatedEnergy);
+}
+
+/**
+ * Measure loudness: peak, RMS, estimated LUFS (K-weighted, BS.1770), crest factor.
  */
 export function measureLoudness(buffer: AudioBuffer): LoudnessAnalysis {
   let peak = 0;
   let sumSquares = 0;
   let totalSamples = 0;
 
+  const channels: Float32Array[] = [];
   for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
     const data = buffer.getChannelData(ch);
+    channels.push(data);
     for (let i = 0; i < data.length; i++) {
       const abs = Math.abs(data[i]);
       if (abs > peak) peak = abs;
@@ -564,9 +666,7 @@ export function measureLoudness(buffer: AudioBuffer): LoudnessAnalysis {
   const peakDB = 20 * Math.log10(peak + 1e-10);
   const rmsDB = 20 * Math.log10(rms + 1e-10);
 
-  // Estimated LUFS (simplified K-weighted approximation)
-  // K-weighting boosts highs and cuts sub-bass, we approximate with +2dB to RMS
-  const estimatedLUFS = rmsDB - 0.691 + 2.0;
+  const estimatedLUFS = measureLUFS(channels, buffer.sampleRate);
 
   const crestFactor = peakDB - rmsDB;
 
@@ -711,6 +811,34 @@ export function analyzeAudio(buffer: AudioBuffer): FullAudioAnalysis {
 // DSP UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ─── Deterministic PRNG ────────────────────────────────────────────────────
+// Seeded random generator (mulberry32). Using this instead of Math.random()
+// makes DSP that relies on randomness (e.g. reverb impulse generation) fully
+// reproducible: the same settings always produce the same output. This is
+// essential so the AI's review/master renders match the user's final render.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Hash a list of numbers into a 32-bit integer seed. */
+function hashSeed(...values: number[]): number {
+  let h = 2166136261 >>> 0;
+  for (const v of values) {
+    // Fold the float into bytes via its scaled integer representation
+    const n = Math.round(v * 1000) >>> 0;
+    h ^= n;
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 // Singleton AudioContext for decoding to ensure consistent sample rates
 let decodingCtx: AudioContext | null = null;
 
@@ -742,21 +870,25 @@ function getDecodingCtx(): AudioContext {
 }
 
 /**
- * Musical tape saturation curve using tanh for warm harmonics.
- * Much more musical than the old waveshaper — generates even harmonics
- * similar to analog tape machines.
+ * Musical tape saturation curve. A symmetric tanh alone produces only ODD
+ * harmonics; real tape/tube warmth comes from a blend of even + odd harmonics.
+ * We add a small asymmetry (DC-style bias before the tanh) to generate 2nd-order
+ * (even) harmonics for genuine analog character, then remove the resulting DC
+ * offset so the curve stays centered.
  */
 function makeTapeSaturationCurve(drive: number, amount: number): Float32Array {
   const n_samples = 8192;
   const curve = new Float32Array(n_samples);
   const driveAmount = 1.0 + drive * 8.0; // 1x to 9x drive
   const blend = Math.max(0, Math.min(1, amount));
+  const bias = 0.12 * driveAmount * 0.1; // subtle asymmetry → even harmonics
+  const dcOffset = Math.tanh(bias);       // remove the DC the bias introduces
 
   for (let i = 0; i < n_samples; i++) {
     const x = (i * 2) / n_samples - 1; // -1 to +1
-    const driven = x * driveAmount;
-    // tanh saturation (warm, even harmonics like tape)
-    const saturated = Math.tanh(driven);
+    const driven = x * driveAmount + bias;
+    // Asymmetric tanh saturation (warm even + odd harmonics like tape)
+    const saturated = Math.tanh(driven) - dcOffset;
     // Blend original and saturated
     curve[i] = x * (1 - blend) + saturated * blend;
   }
@@ -795,6 +927,12 @@ function makeSoftClipCurve(amount: number): Float32Array {
 /**
  * Professional plate reverb impulse response with early reflections,
  * proper frequency-dependent decay, and high-frequency damping.
+ *
+ * DETERMINISTIC: the impulse is generated from a seeded PRNG keyed on the
+ * reverb parameters, so identical settings always yield an identical reverb.
+ * Previously this used Math.random(), which produced a different reverb on
+ * every render — meaning the AI's review/master listening passes heard a
+ * different reverb than the user's final render.
  */
 function createPlateReverb(
   context: BaseAudioContext,
@@ -809,16 +947,18 @@ function createPlateReverb(
   const left = impulse.getChannelData(0);
   const right = impulse.getChannelData(1);
 
+  const rng = mulberry32(hashSeed(decayTime, damping, preDelay, sampleRate));
+
   // Early reflections (first 50ms) — simulate wall bounces
   const earlyReflectionCount = 12;
   const earlyWindow = Math.floor(sampleRate * 0.05);
 
   for (let r = 0; r < earlyReflectionCount; r++) {
-    const time = predelaySamples + Math.floor(Math.random() * earlyWindow);
+    const time = predelaySamples + Math.floor(rng() * earlyWindow);
     const amplitude = 0.6 * Math.pow(0.85, r);
     if (time < length) {
-      left[time] += amplitude * (0.8 + Math.random() * 0.4);
-      right[time] += amplitude * (0.8 + Math.random() * 0.4);
+      left[time] += amplitude * (0.8 + rng() * 0.4);
+      right[time] += amplitude * (0.8 + rng() * 0.4);
     }
   }
 
@@ -830,9 +970,9 @@ function createPlateReverb(
     const t = (i - tailStart) / (length - tailStart); // 0 to 1
     // Exponential decay envelope
     const envelope = Math.pow(1 - t, 1.5 + damping * 2);
-    // Slight randomness for diffusion
-    const noiseL = (Math.random() * 2 - 1);
-    const noiseR = (Math.random() * 2 - 1);
+    // Seeded randomness for diffusion (deterministic)
+    const noiseL = (rng() * 2 - 1);
+    const noiseR = (rng() * 2 - 1);
 
     // Apply frequency-dependent decay (simulate HF absorption)
     // Low-pass the noise by averaging with previous sample
@@ -951,6 +1091,57 @@ export async function processBeat(beatBlob: Blob, speed: number, pitch: number):
 }
 
 
+/**
+ * Look-ahead brickwall true-peak limiter (final mastering stage, in-place).
+ *
+ * Guarantees the output never exceeds `ceilingDb`. A windowed-minimum of the
+ * required per-sample gain provides look-ahead (gain reduction begins before the
+ * peak arrives), and a one-pole release smooths the recovery to avoid distortion.
+ * Because the required gain is the windowed minimum, the ceiling is mathematically
+ * guaranteed — no hard clipping needed.
+ */
+function applyLookaheadLimiter(
+  channels: Float32Array[],
+  sampleRate: number,
+  ceilingDb: number,
+  releaseS: number
+): void {
+  const ceiling = Math.pow(10, ceilingDb / 20);
+  const n = channels[0].length;
+  if (!n) return;
+  const look = Math.max(1, Math.floor(0.0015 * sampleRate)); // 1.5ms look-ahead
+  const rel = Math.exp(-1 / (Math.max(0.01, releaseS) * sampleRate));
+
+  // Required gain per sample (peak across channels)
+  const reqG = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let peak = 0;
+    for (let c = 0; c < channels.length; c++) {
+      const a = Math.abs(channels[c][i]);
+      if (a > peak) peak = a;
+    }
+    reqG[i] = peak > ceiling ? ceiling / peak : 1;
+  }
+
+  // Windowed minimum over [i, i+look] via monotonic deque (O(n))
+  const ctrl = new Float32Array(n);
+  const dq: number[] = [];
+  for (let i = n - 1; i >= 0; i--) {
+    while (dq.length && reqG[dq[dq.length - 1]] >= reqG[i]) dq.pop();
+    dq.push(i);
+    while (dq[0] > i + look) dq.shift();
+    ctrl[i] = reqG[dq[0]];
+  }
+
+  // Apply: instant attack (clamp to ctrl), smooth release toward unity
+  let g = 1;
+  for (let i = 0; i < n; i++) {
+    g = g * rel + (1 - rel);          // release toward 1.0
+    if (g > ctrl[i]) g = ctrl[i];     // never exceed the guaranteed-ceiling gain
+    for (let c = 0; c < channels.length; c++) channels[c][i] *= g;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN MIXING ENGINE — Production-Grade Signal Processing
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1008,28 +1199,31 @@ export async function mixAudio(
   subtractiveEQ.gain.value = settings.vocalEQ.lowMidGain;
   subtractiveEQ.Q.value = settings.vocalEQ.lowMidQ;
 
-  // 3. De-Esser — narrowband EQ attenuation at sibilance frequency
-  // Primary de-essing is the peaking filter cut. The compressor below acts as a
-  // safety limiter only (threshold at -4dBFS) so it does NOT compress normal
-  // vocal content — only catches extreme sibilant bursts that clip through.
-  const deEsserFilter = offlineCtx.createBiquadFilter();
-  deEsserFilter.type = 'peaking';
-  deEsserFilter.frequency.value = settings.deEsser.frequency;
-  deEsserFilter.Q.value = 3.0; // Narrow band
-  deEsserFilter.gain.value = settings.deEsser.enabled
-    ? -Math.min(10, Math.abs(settings.deEsser.ratio * 1.5)) // Cap at -10dB
-    : 0;
+  // 3. De-Esser — split-band DYNAMIC de-esser.
+  // The sibilant band is isolated with a bandpass, compressed (so it only reacts
+  // when sibilance is actually loud), and recombined as:
+  //     output = dry + (compressed_band − band)
+  // The correction term (compressed_band − band) is exactly ZERO when there is no
+  // sibilance (the compressor isn't acting, so compressed_band == band), meaning
+  // the vocal passes untouched — and becomes a dynamic CUT only during "s/sh"
+  // transients. This replaces the old static EQ cut that dulled the band always.
+  const deEsserBP = offlineCtx.createBiquadFilter();
+  deEsserBP.type = 'bandpass';
+  deEsserBP.frequency.value = settings.deEsser.frequency;
+  deEsserBP.Q.value = 2.0;
 
-  // Safety-net compressor: high threshold so it ONLY catches extreme peaks above -4dBFS.
-  // Setting this at the AI's threshold value (typically -25dB) would compress ALL loud
-  // vocal notes as a full-band compressor, creating double-compression with the main
-  // vocal compressor. We keep it as a near-clipper safety net instead.
-  const deEsserCompressor = offlineCtx.createDynamicsCompressor();
-  deEsserCompressor.threshold.value = settings.deEsser.enabled ? -4 : 0;
-  deEsserCompressor.ratio.value = settings.deEsser.enabled ? settings.deEsser.ratio : 1;
-  deEsserCompressor.attack.value = 0.001;
-  deEsserCompressor.release.value = 0.05;
-  deEsserCompressor.knee.value = 3;
+  const deEsserBandComp = offlineCtx.createDynamicsCompressor();
+  deEsserBandComp.threshold.value = settings.deEsser.threshold;
+  deEsserBandComp.ratio.value = settings.deEsser.ratio;
+  deEsserBandComp.attack.value = 0.0005; // very fast — catch transients
+  deEsserBandComp.release.value = 0.04;
+  deEsserBandComp.knee.value = 2;
+
+  const deEsserBandNeg = offlineCtx.createGain();
+  deEsserBandNeg.gain.value = -1; // subtract the dry sibilant band
+
+  const deEsserOut = offlineCtx.createGain();
+  deEsserOut.gain.value = 1.0;
 
   // 4. Main Vocal Compressor (1176-style: fast attack, musical release)
   const vocalCompressor = offlineCtx.createDynamicsCompressor();
@@ -1039,13 +1233,22 @@ export async function mixAudio(
   vocalCompressor.release.value = settings.vocalCompressor.release;
   vocalCompressor.knee.value = settings.vocalCompressor.knee;
 
-  // 5. Multiband Vocal Compression (4 bands)
-  // Band 1: Low (0–250 Hz)
-  const mbLowLP = offlineCtx.createBiquadFilter();
-  mbLowLP.type = 'lowpass';
-  mbLowLP.frequency.value = 250;
-  mbLowLP.Q.value = 0.707;
+  // 5. Multiband Vocal Compression (4 bands) — Linkwitz-Riley 4th-order crossovers
+  // Cascading two Butterworth (Q=0.7071) biquads forms a 4th-order Linkwitz-Riley
+  // filter. Unlike the previous single 12dB/oct biquads, LR filters are phase-
+  // coherent at crossover points and sum back to a flat response — eliminating the
+  // comb-filter notches at 250Hz / 2kHz / 6kHz that hollowed out the vocal.
+  const lr = (type: BiquadFilterType, freq: number) => {
+    const f1 = offlineCtx.createBiquadFilter();
+    f1.type = type; f1.frequency.value = freq; f1.Q.value = 0.7071;
+    const f2 = offlineCtx.createBiquadFilter();
+    f2.type = type; f2.frequency.value = freq; f2.Q.value = 0.7071;
+    f1.connect(f2);
+    return { input: f1, output: f2 };
+  };
 
+  // Band 1: Low (0–250 Hz)
+  const mbLow = lr('lowpass', 250);
   const mbLowComp = offlineCtx.createDynamicsCompressor();
   mbLowComp.threshold.value = settings.multibandVocalComp.low.threshold;
   mbLowComp.ratio.value = settings.multibandVocalComp.low.ratio;
@@ -1053,13 +1256,9 @@ export async function mixAudio(
   mbLowComp.release.value = settings.multibandVocalComp.low.release;
 
   // Band 2: Low-Mid (250–2000 Hz)
-  const mbLowMidBP1 = offlineCtx.createBiquadFilter();
-  mbLowMidBP1.type = 'highpass';
-  mbLowMidBP1.frequency.value = 250;
-  const mbLowMidBP2 = offlineCtx.createBiquadFilter();
-  mbLowMidBP2.type = 'lowpass';
-  mbLowMidBP2.frequency.value = 2000;
-
+  const mbLowMidHP = lr('highpass', 250);
+  const mbLowMidLP = lr('lowpass', 2000);
+  mbLowMidHP.output.connect(mbLowMidLP.input);
   const mbLowMidComp = offlineCtx.createDynamicsCompressor();
   mbLowMidComp.threshold.value = settings.multibandVocalComp.lowMid.threshold;
   mbLowMidComp.ratio.value = settings.multibandVocalComp.lowMid.ratio;
@@ -1067,13 +1266,9 @@ export async function mixAudio(
   mbLowMidComp.release.value = settings.multibandVocalComp.lowMid.release;
 
   // Band 3: High-Mid (2000–6000 Hz)
-  const mbHighMidBP1 = offlineCtx.createBiquadFilter();
-  mbHighMidBP1.type = 'highpass';
-  mbHighMidBP1.frequency.value = 2000;
-  const mbHighMidBP2 = offlineCtx.createBiquadFilter();
-  mbHighMidBP2.type = 'lowpass';
-  mbHighMidBP2.frequency.value = 6000;
-
+  const mbHighMidHP = lr('highpass', 2000);
+  const mbHighMidLP = lr('lowpass', 6000);
+  mbHighMidHP.output.connect(mbHighMidLP.input);
   const mbHighMidComp = offlineCtx.createDynamicsCompressor();
   mbHighMidComp.threshold.value = settings.multibandVocalComp.highMid.threshold;
   mbHighMidComp.ratio.value = settings.multibandVocalComp.highMid.ratio;
@@ -1081,19 +1276,16 @@ export async function mixAudio(
   mbHighMidComp.release.value = settings.multibandVocalComp.highMid.release;
 
   // Band 4: High (6000+ Hz)
-  const mbHighHP = offlineCtx.createBiquadFilter();
-  mbHighHP.type = 'highpass';
-  mbHighHP.frequency.value = 6000;
-
+  const mbHigh = lr('highpass', 6000);
   const mbHighComp = offlineCtx.createDynamicsCompressor();
   mbHighComp.threshold.value = settings.multibandVocalComp.high.threshold;
   mbHighComp.ratio.value = settings.multibandVocalComp.high.ratio;
   mbHighComp.attack.value = settings.multibandVocalComp.high.attack;
   mbHighComp.release.value = settings.multibandVocalComp.high.release;
 
-  // Multiband recombination bus
+  // Multiband recombination bus — LR crossovers sum flat, so unity gain.
   const mbSumGain = offlineCtx.createGain();
-  mbSumGain.gain.value = 0.85; // Slight reduction to compensate for band overlap
+  mbSumGain.gain.value = 1.0;
 
   // 6. Additive EQ — Presence and air
   const presenceEQ = offlineCtx.createBiquadFilter();
@@ -1193,27 +1385,33 @@ export async function mixAudio(
   // Main signal path
   vocalSource.connect(vocalHPF);
   vocalHPF.connect(subtractiveEQ);
-  subtractiveEQ.connect(deEsserFilter);
-  deEsserFilter.connect(deEsserCompressor);
-  deEsserCompressor.connect(vocalCompressor);
 
-  // After main compressor → Split into multiband
-  vocalCompressor.connect(mbLowLP);
-  mbLowLP.connect(mbLowComp);
+  // Dynamic de-esser: dry + (compressed_band − band)
+  subtractiveEQ.connect(deEsserOut); // dry full-band signal
+  if (settings.deEsser.enabled) {
+    subtractiveEQ.connect(deEsserBP);
+    deEsserBP.connect(deEsserBandNeg);
+    deEsserBandNeg.connect(deEsserOut);  // − dry sibilant band
+    deEsserBP.connect(deEsserBandComp);
+    deEsserBandComp.connect(deEsserOut); // + compressed sibilant band
+  }
+  deEsserOut.connect(vocalCompressor);
+
+  // After main compressor → Split into multiband (Linkwitz-Riley bands)
+  vocalCompressor.connect(mbLow.input);
+  mbLow.output.connect(mbLowComp);
   mbLowComp.connect(mbSumGain);
 
-  vocalCompressor.connect(mbLowMidBP1);
-  mbLowMidBP1.connect(mbLowMidBP2);
-  mbLowMidBP2.connect(mbLowMidComp);
+  vocalCompressor.connect(mbLowMidHP.input);
+  mbLowMidLP.output.connect(mbLowMidComp);
   mbLowMidComp.connect(mbSumGain);
 
-  vocalCompressor.connect(mbHighMidBP1);
-  mbHighMidBP1.connect(mbHighMidBP2);
-  mbHighMidBP2.connect(mbHighMidComp);
+  vocalCompressor.connect(mbHighMidHP.input);
+  mbHighMidLP.output.connect(mbHighMidComp);
   mbHighMidComp.connect(mbSumGain);
 
-  vocalCompressor.connect(mbHighHP);
-  mbHighHP.connect(mbHighComp);
+  vocalCompressor.connect(mbHigh.input);
+  mbHigh.output.connect(mbHighComp);
   mbHighComp.connect(mbSumGain);
 
   // After multiband → Additive EQ → Saturation → Output Gain
@@ -1281,9 +1479,42 @@ export async function mixAudio(
   beatCompressor.attack.value = settings.beatCompressor.attack;
   beatCompressor.release.value = settings.beatCompressor.release;
 
-  // Beat Output Gain (with sidechain ducking applied post-render)
+  // Beat Output Gain
   const beatGain = offlineCtx.createGain();
   beatGain.gain.value = settings.beatVolume;
+
+  // Sidechain ducking — applied to the BEAT only, BEFORE it is summed with the
+  // vocal. We derive a control curve from the vocal envelope and automate this
+  // gain node. The old implementation ducked the already-mixed output, which
+  // attenuated the vocal along with the beat (defeating the purpose) and was
+  // capped at 30% of the requested amount.
+  const beatDuckGain = offlineCtx.createGain();
+  if (settings.sidechainDuck > 0) {
+    const vocalCh = vocalData.channels[0];
+    const envAttack = Math.exp(-1 / (sampleRate * 0.005));   // 5ms attack
+    const envRelease = Math.exp(-1 / (sampleRate * 0.12));   // 120ms release
+    let envState = 0;
+    let maxEnv = 1e-6;
+    const env = new Float32Array(duration);
+    for (let i = 0; i < duration; i++) {
+      const abs = i < vocalCh.length ? Math.abs(vocalCh[i]) : 0;
+      if (abs > envState) envState = envAttack * envState + (1 - envAttack) * abs;
+      else envState = envRelease * envState + (1 - envRelease) * abs;
+      env[i] = envState;
+      if (envState > maxEnv) maxEnv = envState;
+    }
+    // Downsample to a control-rate curve for setValueCurveAtTime (≈1 point/256 samples)
+    const points = Math.max(2, Math.min(8192, Math.floor(duration / 256)));
+    const curve = new Float32Array(points);
+    for (let p = 0; p < points; p++) {
+      const idx = Math.floor((p / (points - 1)) * (duration - 1));
+      const norm = Math.min(1, env[idx] / maxEnv);
+      curve[p] = 1 - settings.sidechainDuck * norm; // full duck depth at loudest vocal
+    }
+    beatDuckGain.gain.setValueCurveAtTime(curve, 0, duration / sampleRate);
+  } else {
+    beatDuckGain.gain.value = 1.0;
+  }
 
   // Beat routing
   beatSource.connect(beatLowEQ);
@@ -1292,6 +1523,7 @@ export async function mixAudio(
   beatHighMidEQ.connect(beatHighEQ);
   beatHighEQ.connect(beatCompressor);
   beatCompressor.connect(beatGain);
+  beatGain.connect(beatDuckGain);
 
   // ═══════════════════════════════════════════════════════════════
   // MASTERING CHAIN: Gain → Corrective EQ → Multiband Compressor →
@@ -1320,13 +1552,10 @@ export async function mixAudio(
   masterHighShelf.frequency.value = settings.masterEQ.highShelfFreq;
   masterHighShelf.gain.value = settings.masterEQ.highShelfGain;
 
-  // Master Multiband Compressor (3-band)
+  // Master Multiband Compressor (3-band) — Linkwitz-Riley 4th-order crossovers
+  // (phase-coherent, sums flat — same fix as the vocal multiband).
   // Low band (<250 Hz)
-  const masterMBLowLP = offlineCtx.createBiquadFilter();
-  masterMBLowLP.type = 'lowpass';
-  masterMBLowLP.frequency.value = 250;
-  masterMBLowLP.Q.value = 0.707;
-
+  const masterMBLow = lr('lowpass', 250);
   const masterMBLowComp = offlineCtx.createDynamicsCompressor();
   masterMBLowComp.threshold.value = settings.masterMultiband.low.threshold;
   masterMBLowComp.ratio.value = settings.masterMultiband.low.ratio;
@@ -1334,13 +1563,9 @@ export async function mixAudio(
   masterMBLowComp.release.value = settings.masterMultiband.low.release;
 
   // Mid band (250–4000 Hz)
-  const masterMBMidHP = offlineCtx.createBiquadFilter();
-  masterMBMidHP.type = 'highpass';
-  masterMBMidHP.frequency.value = 250;
-  const masterMBMidLP = offlineCtx.createBiquadFilter();
-  masterMBMidLP.type = 'lowpass';
-  masterMBMidLP.frequency.value = 4000;
-
+  const masterMBMidHP = lr('highpass', 250);
+  const masterMBMidLP = lr('lowpass', 4000);
+  masterMBMidHP.output.connect(masterMBMidLP.input);
   const masterMBMidComp = offlineCtx.createDynamicsCompressor();
   masterMBMidComp.threshold.value = settings.masterMultiband.mid.threshold;
   masterMBMidComp.ratio.value = settings.masterMultiband.mid.ratio;
@@ -1348,32 +1573,27 @@ export async function mixAudio(
   masterMBMidComp.release.value = settings.masterMultiband.mid.release;
 
   // High band (>4000 Hz)
-  const masterMBHighHP = offlineCtx.createBiquadFilter();
-  masterMBHighHP.type = 'highpass';
-  masterMBHighHP.frequency.value = 4000;
-
+  const masterMBHigh = lr('highpass', 4000);
   const masterMBHighComp = offlineCtx.createDynamicsCompressor();
   masterMBHighComp.threshold.value = settings.masterMultiband.high.threshold;
   masterMBHighComp.ratio.value = settings.masterMultiband.high.ratio;
   masterMBHighComp.attack.value = settings.masterMultiband.high.attack;
   masterMBHighComp.release.value = settings.masterMultiband.high.release;
 
-  // Multiband recombination
+  // Multiband recombination — LR crossovers sum flat, so unity gain.
   const masterMBSum = offlineCtx.createGain();
-  masterMBSum.gain.value = 0.9;
+  masterMBSum.gain.value = 1.0;
 
   // Soft Clipper (pre-limiter transient shaving)
   const softClipper = offlineCtx.createWaveShaper();
   softClipper.curve = makeSoftClipCurve(settings.softClipAmount);
   softClipper.oversample = '4x';
 
-  // Brickwall Limiter (true peak ceiling)
-  const masterLimiter = offlineCtx.createDynamicsCompressor();
-  masterLimiter.threshold.value = settings.masterLimiter.ceiling;
-  masterLimiter.ratio.value = 20.0; // Brickwall
-  masterLimiter.attack.value = 0.001;
-  masterLimiter.release.value = settings.masterLimiter.release;
-  masterLimiter.knee.value = 0;
+  // NOTE: The brickwall limiter is now applied POST-render as a proper
+  // look-ahead true-peak limiter (see applyLookaheadLimiter below), so it is
+  // genuinely the LAST stage. Previously an in-graph DynamicsCompressor (no
+  // look-ahead) let transients overshoot, and post-render makeup gain was then
+  // applied AFTER it — re-introducing peaks that were hard-clamped (= clipping).
 
   // ═══════════════════════════════════════════════════════════════
   // MASTER CHAIN ROUTING
@@ -1385,7 +1605,7 @@ export async function mixAudio(
   reverbGain.connect(masterInputGain);
   delayGain.connect(masterInputGain);
   doublerGain.connect(masterInputGain);
-  beatGain.connect(masterInputGain);
+  beatDuckGain.connect(masterInputGain); // beat (post sidechain duck)
 
   // Backup vocals
   if (backupSource) {
@@ -1403,24 +1623,22 @@ export async function mixAudio(
   masterLowShelf.connect(masterMidEQ);
   masterMidEQ.connect(masterHighShelf);
 
-  // Master Multiband split
-  masterHighShelf.connect(masterMBLowLP);
-  masterMBLowLP.connect(masterMBLowComp);
+  // Master Multiband split (Linkwitz-Riley bands)
+  masterHighShelf.connect(masterMBLow.input);
+  masterMBLow.output.connect(masterMBLowComp);
   masterMBLowComp.connect(masterMBSum);
 
-  masterHighShelf.connect(masterMBMidHP);
-  masterMBMidHP.connect(masterMBMidLP);
-  masterMBMidLP.connect(masterMBMidComp);
+  masterHighShelf.connect(masterMBMidHP.input);
+  masterMBMidLP.output.connect(masterMBMidComp);
   masterMBMidComp.connect(masterMBSum);
 
-  masterHighShelf.connect(masterMBHighHP);
-  masterMBHighHP.connect(masterMBHighComp);
+  masterHighShelf.connect(masterMBHigh.input);
+  masterMBHigh.output.connect(masterMBHighComp);
   masterMBHighComp.connect(masterMBSum);
 
-  // Soft clip → Limiter → Output
+  // Soft clip → Output. The brickwall limiter runs post-render (final stage).
   masterMBSum.connect(softClipper);
-  softClipper.connect(masterLimiter);
-  masterLimiter.connect(offlineCtx.destination);
+  softClipper.connect(offlineCtx.destination);
 
   // Start all sources
   vocalSource.start(0);
@@ -1474,88 +1692,31 @@ export async function mixAudio(
     }
   }
 
-  // ── Sidechain Ducking (post-render) ──
-  // We duck the beat signal when the vocal is loud.
-  // Since we've already rendered, we approximate by comparing vocal envelope
-  // to the mixed output and applying gentle gain reduction.
-  // This is a simplified approach — in a real DAW you'd use sidechain routing.
-  if (settings.sidechainDuck > 0) {
-    // We already have the mixed output, so ducking is applied to the final output
-    // Detect vocal envelope from the original vocal data
-    const vocalEnvelope = new Float32Array(duration);
-    const vocalChannel = vocalData.channels[0];
-    const envAttack = Math.exp(-1 / (sampleRate * 0.005));
-    const envRelease = Math.exp(-1 / (sampleRate * 0.05));
-    let envState = 0;
+  // ── LUFS-Aware Makeup Gain (K-weighted, applied BEFORE the limiter) ──
+  // Measure true (BS.1770) loudness and apply makeup gain toward the target.
+  // Sidechain ducking is no longer done here — it is applied in-graph to the
+  // beat only (see beatDuckGain above). Driving the limiter with makeup gain is
+  // how loudness is achieved; the limiter (next, final) controls the peaks.
+  const currentLUFS = measureLUFS(outChannels, sampleRate);
+  const lufsCorrection = settings.lufsTarget - currentLUFS;
 
-    for (let i = 0; i < Math.min(vocalChannel.length, duration); i++) {
-      const abs = Math.abs(vocalChannel[i]);
-      if (abs > envState) {
-        envState = envAttack * envState + (1 - envAttack) * abs;
-      } else {
-        envState = envRelease * envState + (1 - envRelease) * abs;
-      }
-      vocalEnvelope[i] = envState;
-    }
-
-    // Note: This is an approximation. Because the vocal and beat are already mixed,
-    // we apply a very gentle ducking to the overall output based on vocal presence.
-    // The actual ducking amount is kept subtle to avoid artifacts.
-    const duckAmount = settings.sidechainDuck * 0.3; // Keep it subtle
-    for (let i = 0; i < outChannels[0].length; i++) {
-      const env = i < vocalEnvelope.length ? vocalEnvelope[i] : 0;
-      const duckGain = 1.0 - (env * duckAmount);
-      // Only duck slightly to create space, don't apply to silence
-      if (env > 0.01) {
-        // Apply to output — since both vocal and beat are mixed, this creates
-        // a subtle pumping effect that helps the vocal sit forward
-        outChannels[0][i] *= (1.0 - duckAmount * 0.5) + duckAmount * 0.5 * duckGain;
-        outChannels[1][i] *= (1.0 - duckAmount * 0.5) + duckAmount * 0.5 * duckGain;
-      }
-    }
-  }
-
-  // ── LUFS-Aware Normalization ──
-  // Measure the rendered output's loudness and adjust gain to hit the target LUFS
-  let peak = 0;
-  let sumSquares = 0;
-  let totalSamples = 0;
-
-  for (let c = 0; c < outChannels.length; c++) {
-    const channel = outChannels[c];
-    for (let i = 0; i < channel.length; i++) {
-      const abs = Math.abs(channel[i]);
-      if (abs > peak) peak = abs;
-      sumSquares += channel[i] * channel[i];
-      totalSamples++;
-    }
-  }
-
-  const rms = Math.sqrt(sumSquares / totalSamples);
-  const currentRMSdB = 20 * Math.log10(rms + 1e-10);
-  // Approximate LUFS from RMS (K-weighted approximation: LUFS ≈ RMS_dB + 1.3)
-  const currentEstimatedLUFS = currentRMSdB + 1.3;
-  const targetLUFS = settings.lufsTarget;
-  const lufsCorrection = targetLUFS - currentEstimatedLUFS;
-
-  // Convert dB correction to linear gain
+  // Convert dB correction to linear gain. Wider range is safe now because a true
+  // brickwall limiter runs afterwards (no post-limiter gain to re-introduce peaks).
   let normalizeFactor = Math.pow(10, lufsCorrection / 20);
-
-  // Safety: don't boost more than 12dB or reduce more than 6dB
-  normalizeFactor = Math.max(0.5, Math.min(4.0, normalizeFactor));
-
-  // Apply gain and ensure we don't clip past the ceiling
-  const ceilingLinear = Math.pow(10, settings.masterLimiter.ceiling / 20);
+  normalizeFactor = Math.max(0.25, Math.min(8.0, normalizeFactor));
 
   for (let c = 0; c < outChannels.length; c++) {
     const channel = outChannels[c];
-    for (let i = 0; i < channel.length; i++) {
-      channel[i] *= normalizeFactor;
-      // Final true-peak limiting (safety)
-      if (channel[i] > ceilingLinear) channel[i] = ceilingLinear;
-      if (channel[i] < -ceilingLinear) channel[i] = -ceilingLinear;
-    }
+    for (let i = 0; i < channel.length; i++) channel[i] *= normalizeFactor;
   }
+
+  // ── Final Brickwall Look-Ahead Limiter (true last stage) ──
+  applyLookaheadLimiter(
+    outChannels,
+    sampleRate,
+    settings.masterLimiter.ceiling,
+    settings.masterLimiter.release
+  );
 
   const wavBuffer = encodeWAV(outChannels, renderedBuffer.sampleRate);
   return new Blob([wavBuffer], { type: 'audio/wav' });
