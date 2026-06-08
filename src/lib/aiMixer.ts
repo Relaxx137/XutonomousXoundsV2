@@ -58,6 +58,7 @@ export interface AILog {
   parameterDeltas?: ParameterDelta[];
   durationMs?: number;
   phase?: 'analysis' | 'mixing' | 'review' | 'mastering' | 'genre' | 'system' | 'skill_match';
+  timestamp?: number;
 }
 
 async function audioBufferToWavBlob(buffer: AudioBuffer): Promise<Blob> {
@@ -470,10 +471,37 @@ export async function runAIAgentNetwork(
     });
 
     const vocalBuffer = await decodeBlob(vocalBlob);
+    onProgress({ agent: 'Acoustic Analyst', message: `Vocal decoded — ${vocalBuffer.duration.toFixed(1)}s @ ${(vocalBuffer.sampleRate/1000).toFixed(1)}kHz`, phase: 'analysis' });
     const beatBuffer = await decodeBlob(beatBlob);
+    onProgress({ agent: 'Acoustic Analyst', message: `Beat decoded — ${beatBuffer.duration.toFixed(1)}s @ ${(beatBuffer.sampleRate/1000).toFixed(1)}kHz`, phase: 'analysis' });
 
     const vocalAnalysis = analyzeAudio(vocalBuffer);
+    onProgress({
+      agent: 'Acoustic Analyst',
+      message: `Vocal fingerprint computed`,
+      details: [
+        `RMS ${vocalAnalysis.loudness.rmsDB.toFixed(1)} dBFS  ·  crest ${vocalAnalysis.loudness.crestFactor.toFixed(1)} dB`,
+        `Dominant freq: ${vocalAnalysis.spectral.dominantFrequency.toFixed(0)} Hz`,
+        `Bass ${vocalAnalysis.spectral.bass.toFixed(1)} dB  ·  brilliance ${vocalAnalysis.spectral.brilliance.toFixed(1)} dB`,
+        vocalAnalysis.sibilance.hasSibilance
+          ? `⚠ Sibilance detected @ ${vocalAnalysis.sibilance.peakFrequency} Hz (${(vocalAnalysis.sibilance.severity*100).toFixed(0)}% severity)`
+          : `✓ No significant sibilance`,
+        `Stereo width: ${(vocalAnalysis.stereo.width*100).toFixed(0)}%  ·  corr: ${vocalAnalysis.stereo.correlation.toFixed(2)}`,
+      ].join('\n'),
+      phase: 'analysis',
+    });
     const beatAnalysis = analyzeAudio(beatBuffer);
+    onProgress({
+      agent: 'Acoustic Analyst',
+      message: `Beat fingerprint computed`,
+      details: [
+        `RMS ${beatAnalysis.loudness.rmsDB.toFixed(1)} dBFS  ·  crest ${beatAnalysis.loudness.crestFactor.toFixed(1)} dB`,
+        `Sub-bass ${beatAnalysis.spectral.subBass.toFixed(1)} dB  ·  bass ${beatAnalysis.spectral.bass.toFixed(1)} dB`,
+        `Level gap (vocal − beat): ${(vocalAnalysis.loudness.rmsDB - beatAnalysis.loudness.rmsDB).toFixed(1)} dB`,
+        `Beat stereo: ${(beatAnalysis.stereo.width*100).toFixed(0)}% wide`,
+      ].join('\n'),
+      phase: 'analysis',
+    });
 
     const vocalAnalysisStr = formatAnalysis('VOCAL', vocalAnalysis);
     const beatAnalysisStr = formatAnalysis('BEAT', beatAnalysis);
@@ -561,6 +589,7 @@ Based on BOTH your listening AND the measurements above:
 
 Provide a detailed acoustic assessment with specific frequency recommendations.`;
 
+        onProgress({ agent: 'Acoustic Analyst', message: 'Querying Gemini — AI listening pass on raw tracks...', phase: 'analysis' });
         const analysisResponse = await generateContentWithCycle(ai, {
           contents: [{ text: analysisPrompt }, ...contents]
         });
@@ -615,6 +644,7 @@ Based on the spectral characteristics, dynamic range, frequency distribution, an
 
 Output JSON only.`;
 
+          onProgress({ agent: 'Genre Intelligence', message: 'Querying Gemini — genre classification from fingerprint...', phase: 'genre' });
           const genreResponse = await generateContentWithCycle(ai, {
             contents: [{ text: genrePrompt }],
             config: {
@@ -629,7 +659,7 @@ Output JSON only.`;
           onProgress({
             agent: 'Genre Intelligence',
             message: `Detected genre: ${detectedGenre.toUpperCase()}`,
-            details: genreResult.genreReasoning || '',
+            details: `Target: ${GENRE_LUFS_TARGETS[detectedGenre] ?? -9} LUFS  ·  ${genreResult.genreReasoning || ''}`,
             confidence: (genreResult.confidence as ConfidenceLevel) || 'medium',
             thoughtProcess: JSON.stringify(genreResult, null, 2),
             phase: 'genre',
@@ -721,6 +751,7 @@ CRITICAL RULES:
 
 Output JSON only.`;
 
+        onProgress({ agent: 'Mix Engineer', message: 'Querying Gemini — constructing full mix strategy...', phase: 'mixing' });
         const mixResponse = await generateContentWithCycle(ai, {
           contents: [{ text: mixPrompt }],
           config: {
@@ -736,10 +767,11 @@ Output JSON only.`;
           agent: 'Mix Engineer',
           message: 'Initial mix strategy complete.',
           details: [
-            `EQ: ${draftMix.reasoning?.eqReasoning || 'Applied'}`,
-            `Compression: ${draftMix.reasoning?.compressionReasoning || 'Applied'}`,
-            `De-Esser: ${draftMix.reasoning?.deEsserReasoning || 'Checked'}`,
-            `Spatial: ${draftMix.reasoning?.spatialReasoning || 'Configured'}`,
+            `EQ: HPF ${currentSettings?.vocalEQ?.lowCutFreq || 100}Hz  ·  mud ${currentSettings?.vocalEQ?.lowMidGain >= 0 ? '+' : ''}${(currentSettings?.vocalEQ?.lowMidGain ?? 0).toFixed(1)}dB`,
+            `De-esser: ${currentSettings?.deEsser?.enabled ? `enabled @ ${currentSettings?.deEsser?.frequency}Hz  thresh ${currentSettings?.deEsser?.threshold}dB` : 'disabled'}`,
+            `Comp: ${currentSettings?.vocalCompressor?.threshold ?? -24}dB / ${currentSettings?.vocalCompressor?.ratio ?? 4}:1`,
+            `Reverb ${Math.round((currentSettings?.reverb ?? 0.25)*100)}%  ·  delay ${Math.round((currentSettings?.echo ?? 0.1)*100)}%  ·  doubler ${Math.round((currentSettings?.doubler ?? 0.2)*100)}%`,
+            `LUFS target: ${currentSettings?.lufsTarget ?? -9}  ·  master gain: ${currentSettings?.masterGain ?? 1.0}`,
           ].join('\n'),
           confidence: (draftMix.confidence as ConfidenceLevel) || 'medium',
           thoughtProcess: JSON.stringify(draftMix.reasoning, null, 2),
@@ -842,6 +874,7 @@ Improve the WEAKEST scoring areas first. Adjust only what the measurements justi
 Provide UPDATED settings. Be specific about what you changed and why.
 Output JSON only.`;
 
+        onProgress({ agent: `Review Engineer (Pass ${i})`, message: 'Querying Gemini — text-only refinement (no audio upload)...', phase: 'review' });
         const reviewResponse = await generateContentWithCycle(ai, {
           contents: [{ text: reviewPrompt }],
           config: {
@@ -970,6 +1003,7 @@ Mastering is final polish — coherence, loudness, and subtle tonal balance.
 
 Output JSON only.`;
 
+    onProgress({ agent: 'Mastering Engineer', message: 'Querying Gemini — listening to pre-master audio...', phase: 'mastering' });
     const masterResponse = await generateContentWithCycle(ai, {
       contents: [{ text: masterPrompt }, preMasterPart],
       config: {

@@ -263,7 +263,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   setIsAiMixing: (isAiMixing) => set({ isAiMixing }),
   aiLogs: [],
   setAiLogs: (aiLogs) => set({ aiLogs }),
-  appendAiLog: (log) => set((state) => ({ aiLogs: [...state.aiLogs, log] })),
+  appendAiLog: (log) => set((state) => ({ aiLogs: [...state.aiLogs, { ...log, timestamp: Date.now() }] })),
   aiReasoning: '',
   setAiReasoning: (aiReasoning) => set({ aiReasoning }),
   expandedLogIndex: null,
