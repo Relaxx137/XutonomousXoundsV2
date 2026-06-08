@@ -2,7 +2,7 @@ import React, { useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Key, Sparkles, Settings2, TreePine, Layers } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
-import { mixAudio } from './lib/audioUtils';
+import { mixAudio, defaultMixSettings, type MixSettings } from './lib/audioUtils';
 import { runAIAgentNetwork } from './lib/aiMixer';
 import { getSkillTreeStats, loadSkillTree } from './lib/agentMemory';
 
@@ -15,6 +15,38 @@ import { ResultStep } from './components/steps/ResultStep';
 import { TutorialModal } from './components/TutorialModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SkillLibrary } from './components/SkillLibrary';
+
+const RAW_MIX_SETTINGS: MixSettings = {
+  ...defaultMixSettings,
+  vocalEQ: { lowCutFreq: 20, lowMidFreq: 300, lowMidGain: 0, lowMidQ: 1, highMidFreq: 2000, highMidGain: 0, highMidQ: 1, presenceFreq: 4000, presenceGain: 0, presenceQ: 1, airFreq: 10000, airGain: 0 },
+  deEsser: { enabled: false, frequency: 6500, threshold: -10, ratio: 1 },
+  vocalCompressor: { threshold: 0, ratio: 1, attack: 0.05, release: 0.3, knee: 0 },
+  multibandVocalComp: {
+    low:     { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+    lowMid:  { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+    highMid: { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+    high:    { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+  },
+  parallelCompression: { enabled: false, wetDry: 0, threshold: -40, ratio: 1, attack: 0.05, release: 0.3 },
+  saturation: 0,
+  saturationDrive: 0,
+  reverb: 0,
+  echo: 0,
+  doubler: 0,
+  beatEQ: { lowFreq: 80, lowGain: 0, lowMidFreq: 400, lowMidGain: 0, highMidFreq: 3000, highMidGain: 0, highFreq: 8000, highGain: 0 },
+  beatCompressor: { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+  sidechainDuck: 0,
+  stereoImaging: { width: 1.0, bassMonoCutoff: 0 },
+  masterMultiband: {
+    low:  { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+    mid:  { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+    high: { threshold: 0, ratio: 1, attack: 0.05, release: 0.3 },
+  },
+  masterEQ: { lowShelfFreq: 100, lowShelfGain: 0, midFreq: 2000, midGain: 0, midQ: 1, highShelfFreq: 10000, highShelfGain: 0 },
+  softClipAmount: 0,
+  masterGain: 1.0,
+  lufsTarget: -14,
+};
 
 const stepArray = ['upload', 'prepare', 'record', 'mix', 'result'] as const;
 const stepNames = { upload: 'Upload', prepare: 'Prepare', record: 'Record', mix: 'Mix', result: 'Master' };
@@ -38,6 +70,7 @@ export default function App() {
     setIsAiMixing, setActiveAgentPhase,
     setSettings,
     setMixedBlob, setMixedUrl, mixedUrl, addToHistory,
+    setRawMixUrl, rawMixUrl,
     setIsProcessing,
     isMastering, setIsMastering, setMasteringJobId, setMasteredUrl,
     referenceBlob,
@@ -138,11 +171,17 @@ export default function App() {
     if (!vocal || !beat) return;
     setIsProcessing(true);
     try {
-      const resultBlob = await mixAudio(vocal, beat, backupVocalBlob, settings);
+      const [resultBlob, rawBlob] = await Promise.all([
+        mixAudio(vocal, beat, backupVocalBlob, settings),
+        mixAudio(vocal, beat, backupVocalBlob, RAW_MIX_SETTINGS),
+      ]);
       if (mixedUrl) URL.revokeObjectURL(mixedUrl);
+      if (rawMixUrl) URL.revokeObjectURL(rawMixUrl);
       const url = URL.createObjectURL(resultBlob);
+      const rawUrl = URL.createObjectURL(rawBlob);
       setMixedBlob(resultBlob);
       setMixedUrl(url);
+      setRawMixUrl(rawUrl);
       addToHistory(url);
       setStep('result');
     } catch (err) {

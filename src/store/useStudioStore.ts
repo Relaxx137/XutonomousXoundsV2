@@ -119,6 +119,8 @@ interface StudioState {
   // AI
   aiIterations: number;
   setAiIterations: (n: number) => void;
+  rawMixUrl: string | null;
+  setRawMixUrl: (url: string | null) => void;
   isAiMixing: boolean;
   setIsAiMixing: (v: boolean) => void;
   aiLogs: AILog[];
@@ -253,8 +255,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   isProcessing: false,
   setIsProcessing: (isProcessing) => set({ isProcessing }),
 
-  aiIterations: 2,
+  aiIterations: 1,
   setAiIterations: (aiIterations) => set({ aiIterations }),
+  rawMixUrl: null,
+  setRawMixUrl: (rawMixUrl) => set({ rawMixUrl }),
   isAiMixing: false,
   setIsAiMixing: (isAiMixing) => set({ isAiMixing }),
   aiLogs: [],
@@ -326,6 +330,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       backupVocalUrl: null,
       mixedBlob: null,
       mixedUrl: null,
+      rawMixUrl: null,
       aiLogs: [],
       settings: defaultMixSettings,
       recordingMode: 'main',

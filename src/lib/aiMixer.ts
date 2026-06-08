@@ -527,7 +527,7 @@ export async function runAIAgentNetwork(
     const EARLY_STOP_SCORE = 88;   // a mix this good needs no further passes
     const MIN_IMPROVEMENT = 1.5;   // stop if a pass barely moves the needle
 
-    for (let i = 1; i <= iterations; i++) {
+    for (let i = 1; i <= 1 + iterations; i++) {
       if (i === 1) {
         // ═══════════════════════════════════════════════════════════════
         // AGENT 1: Acoustic Analyst + AI Listening

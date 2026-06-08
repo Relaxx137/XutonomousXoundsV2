@@ -194,7 +194,7 @@ export function AIAgentPanel({ onDeploy }: AIAgentPanelProps) {
           </div>
 
           <div className="bg-white/5 p-4 rounded-xl border border-white/10">
-            <ProSlider label="AI Passes" icon={Bot} value={aiIterations} min={1} max={4} step={1} onChange={setAiIterations} formatValue={(v) => `${v}`} colorClass="bg-amber-500" glowClass="shadow-amber-500/50" />
+            <ProSlider label="Review Passes" icon={Bot} value={aiIterations} min={0} max={3} step={1} onChange={setAiIterations} formatValue={(v) => v === 0 ? 'off' : `${v}`} colorClass="bg-amber-500" glowClass="shadow-amber-500/50" />
           </div>
 
           {(aiLogs as AILog[]).length > 0 && !isAiMixing && (
