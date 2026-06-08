@@ -574,51 +574,81 @@ export function measureLoudness(buffer: AudioBuffer): LoudnessAnalysis {
 }
 
 /**
- * Detect sibilance by measuring energy in the 4–10kHz range relative to overall.
+ * Detect sibilance by measuring energy in the 5–9kHz sibilance band relative
+ * to a 1–4kHz reference band, using the Goertzel algorithm for frequency-accurate
+ * energy measurement. This correctly identifies "s/sh/ch" transients rather than
+ * the old first-order difference which measured ~11kHz noise instead.
  */
 export function detectSibilance(buffer: AudioBuffer): SibilanceAnalysis {
   const data = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
 
-  // Analyze short frames to find transient sibilance
   const frameSize = 2048;
   const hopSize = 1024;
-  let maxSibilanceRatio = 0;
-  let sibilantFreq = 6500;
 
-  const numFrames = Math.min(50, Math.floor(data.length / hopSize) - 1); // Sample up to 50 frames
-  const step = Math.max(1, Math.floor((data.length / hopSize - 1) / numFrames));
+  const maxFrames = 30;
+  const totalPossible = Math.floor((data.length - frameSize) / hopSize) + 1;
+  if (totalPossible < 1) return { hasSibilance: false, peakFrequency: 6500, severity: 0 };
+
+  const numFrames = Math.min(maxFrames, totalPossible);
+  const step = Math.max(1, Math.floor(totalPossible / numFrames));
+
+  // Sibilance band: 5–9 kHz; reference band: 1–4 kHz (vocals live here)
+  const sibilantFreqs = [5000, 6000, 7000, 8000, 9000].filter(f => f < sampleRate / 2);
+  const referenceFreqs = [1000, 2000, 3000, 4000].filter(f => f < sampleRate / 2);
+
+  const goertzelMag = (seg: Float32Array, freq: number): number => {
+    const w = (2 * Math.PI * freq) / sampleRate;
+    const coeff = 2 * Math.cos(w);
+    let s1 = 0, s2 = 0;
+    for (let i = 0; i < seg.length; i++) {
+      const s0 = seg[i] + coeff * s1 - s2;
+      s2 = s1; s1 = s0;
+    }
+    return Math.sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2);
+  };
+
+  let maxRatio = 0;
+  let peakFreq = 6500;
 
   for (let f = 0; f < numFrames; f++) {
-    const startIdx = f * step * hopSize;
-    if (startIdx + frameSize > data.length) break;
-
-    // Measure energy in sibilant range (5–9kHz) vs total using simple bandpass estimation
-    let totalEnergy = 0;
-    let sibilantEnergy = 0;
-
-    // Quick energy estimation using zero-crossing rate and high-frequency content
-    for (let i = startIdx; i < startIdx + frameSize && i < data.length - 1; i++) {
-      const sample = data[i];
-      totalEnergy += sample * sample;
-
-      // Simple high-pass approximation via first-order difference
-      const diff = data[i] - data[i - 1 < 0 ? 0 : i - 1];
-      sibilantEnergy += diff * diff;
+    const startIdx = Math.min(f * step * hopSize, data.length - frameSize);
+    const segment = new Float32Array(frameSize);
+    for (let i = 0; i < frameSize; i++) {
+      const win = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (frameSize - 1)));
+      segment[i] = data[startIdx + i] * win;
     }
 
-    const ratio = totalEnergy > 0 ? sibilantEnergy / totalEnergy : 0;
-    if (ratio > maxSibilanceRatio) {
-      maxSibilanceRatio = ratio;
+    let sibilantEnergy = 0;
+    let maxSibilantMag = 0;
+    let framePeakFreq = sibilantFreqs[0];
+    for (const freq of sibilantFreqs) {
+      const mag = goertzelMag(segment, freq);
+      sibilantEnergy += mag * mag;
+      if (mag > maxSibilantMag) { maxSibilantMag = mag; framePeakFreq = freq; }
+    }
+
+    let refEnergy = 0;
+    for (const freq of referenceFreqs) {
+      refEnergy += Math.pow(goertzelMag(segment, freq), 2);
+    }
+
+    const avgSibilant = sibilantEnergy / sibilantFreqs.length;
+    const avgRef = refEnergy / referenceFreqs.length;
+    // Ratio > 1.5 = mild sibilance presence; > 5.5 = severe
+    const ratio = avgRef > 1e-12 ? avgSibilant / avgRef : 0;
+
+    if (ratio > maxRatio) {
+      maxRatio = ratio;
+      peakFreq = framePeakFreq;
     }
   }
 
-  // Normalize severity (typical values 0.5–4.0 range for the ratio)
-  const severity = Math.min(1.0, Math.max(0, (maxSibilanceRatio - 0.5) / 3.0));
+  const severity = Math.min(1.0, Math.max(0, (maxRatio - 1.5) / 4.0));
 
   return {
-    hasSibilance: severity > 0.3,
-    peakFrequency: sibilantFreq,
+    hasSibilance: severity > 0.2,
+    peakFrequency: peakFreq,
     severity,
   };
 }
@@ -978,19 +1008,24 @@ export async function mixAudio(
   subtractiveEQ.gain.value = settings.vocalEQ.lowMidGain;
   subtractiveEQ.Q.value = settings.vocalEQ.lowMidQ;
 
-  // 3. De-Esser (sidechain-style: bandpass detection → dynamics reduction)
-  // Implemented as a narrow-band compressor that only acts on sibilant frequencies
+  // 3. De-Esser — narrowband EQ attenuation at sibilance frequency
+  // Primary de-essing is the peaking filter cut. The compressor below acts as a
+  // safety limiter only (threshold at -4dBFS) so it does NOT compress normal
+  // vocal content — only catches extreme sibilant bursts that clip through.
   const deEsserFilter = offlineCtx.createBiquadFilter();
   deEsserFilter.type = 'peaking';
   deEsserFilter.frequency.value = settings.deEsser.frequency;
   deEsserFilter.Q.value = 3.0; // Narrow band
   deEsserFilter.gain.value = settings.deEsser.enabled
-    ? -Math.abs(settings.deEsser.ratio * 1.5) // Negative gain to attenuate sibilance
+    ? -Math.min(10, Math.abs(settings.deEsser.ratio * 1.5)) // Cap at -10dB
     : 0;
 
-  // Additional de-essing via dynamics compressor focused on the sibilant range
+  // Safety-net compressor: high threshold so it ONLY catches extreme peaks above -4dBFS.
+  // Setting this at the AI's threshold value (typically -25dB) would compress ALL loud
+  // vocal notes as a full-band compressor, creating double-compression with the main
+  // vocal compressor. We keep it as a near-clipper safety net instead.
   const deEsserCompressor = offlineCtx.createDynamicsCompressor();
-  deEsserCompressor.threshold.value = settings.deEsser.enabled ? settings.deEsser.threshold : 0;
+  deEsserCompressor.threshold.value = settings.deEsser.enabled ? -4 : 0;
   deEsserCompressor.ratio.value = settings.deEsser.enabled ? settings.deEsser.ratio : 1;
   deEsserCompressor.attack.value = 0.001;
   deEsserCompressor.release.value = 0.05;

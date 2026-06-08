@@ -379,6 +379,14 @@ function parseSafeJSON(text: string) {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const GENRE_LUFS_TARGETS: Record<string, number> = {
+  'hip-hop': -8,
+  'pop': -9,
+  'electronic': -7,
+  'acoustic': -12,
+  'custom': -9,
+};
+
 const GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.0-flash',
@@ -680,14 +688,24 @@ MASTERING CHAIN:
 - Master EQ: Sweetening. Very subtle moves (±2dB max).
 - Soft clipper: Shave transient peaks before limiter (0.1-0.3).
 - Limiter ceiling: -1.0 dBTP for streaming safety.
-- LUFS target: ${vocalAnalysis.loudness.estimatedLUFS < -18 ? '-10 (needs significant gain)' : '-9 (standard competitive loudness)'} — detected genre: ${detectedGenre}
+- LUFS target: ${GENRE_LUFS_TARGETS[detectedGenre] ?? -9} LUFS (${detectedGenre.toUpperCase()} genre standard)
+
+═══ MEASURED DATA — RESPOND TO THESE SPECIFICALLY ═══
+Vocal RMS: ${vocalAnalysis.loudness.rmsDB.toFixed(1)} dBFS  |  Beat RMS: ${beatAnalysis.loudness.rmsDB.toFixed(1)} dBFS
+Level gap: ${(vocalAnalysis.loudness.rmsDB - beatAnalysis.loudness.rmsDB).toFixed(1)} dB (vocal vs beat) — vocal should typically sit 2–5 dB LOUDER in RMS
+${vocalAnalysis.sibilance.hasSibilance
+  ? `⚠️  SIBILANCE DETECTED at ${vocalAnalysis.sibilance.peakFrequency} Hz (severity ${(vocalAnalysis.sibilance.severity * 100).toFixed(0)}%) — ENABLE de-esser, set frequency to ${vocalAnalysis.sibilance.peakFrequency} Hz, threshold ≈ -20 dB`
+  : `✅  No significant sibilance — de-esser can be gentle (threshold -28 to -32 dB) or disabled`}
+Vocal crest factor: ${vocalAnalysis.loudness.crestFactor.toFixed(1)} dB ${vocalAnalysis.loudness.crestFactor > 20 ? '(very dynamic — use more compression)' : vocalAnalysis.loudness.crestFactor < 8 ? '(already compressed — use gentle settings)' : '(normal dynamics)'}
+Vocal stereo: ${(vocalAnalysis.stereo.width * 100).toFixed(0)}% wide${vocalAnalysis.stereo.correlation > 0.95 ? ' (mono vocal — good for centering)' : ''}
 
 CRITICAL RULES:
 - If sibilance was detected, ENABLE the de-esser and set frequency to the detected peak.
-- Beat high-mid gain should be NEGATIVE to carve space for vocals.
-- Reverb pre-delay should be 15-30ms to keep vocal upfront.
-- Parallel compression wetDry should be 0.15-0.35 (subtle blend).
-- Bass mono cutoff should be 100-180Hz for tight low end.
+- Beat high-mid gain should be NEGATIVE to carve space for vocals (cut 2–4 kHz on beat).
+- Reverb pre-delay should be 15-30ms to keep vocal upfront, not buried in reverb.
+- Parallel compression wetDry should be 0.15-0.35 (subtle NY-style blend).
+- Bass mono cutoff should be 100-180Hz for tight, focused low end.
+- Set lufsTarget to ${GENRE_LUFS_TARGETS[detectedGenre] ?? -9} LUFS for ${detectedGenre}.
 - Keep all moves MUSICAL. Less is more in mastering.
 
 Output JSON only.`;
@@ -760,10 +778,18 @@ Output JSON only.`;
           }
         });
 
+        const targetLufs = GENRE_LUFS_TARGETS[detectedGenre] ?? -9;
+        const lufsGap = targetLufs - mixAnalysis.loudness.estimatedLUFS;
         const reviewPrompt = `You are a Senior Mix Engineer reviewing a rendered mix. Listen to the audio and compare it with the numerical measurements.
 
 ═══ CURRENT MIX MEASUREMENTS ═══
 ${mixAnalysisStr}
+
+═══ LOUDNESS TARGET ═══
+Genre: ${detectedGenre.toUpperCase()}
+Target LUFS: ${targetLufs} LUFS
+Current LUFS: ${mixAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS
+Gap: ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB ${Math.abs(lufsGap) > 3 ? `⚠️ SIGNIFICANT — ${lufsGap > 0 ? 'increase masterGain' : 'decrease masterGain or reduce compression'}` : '✅ close to target'}
 
 ═══ ORIGINAL TRACK MEASUREMENTS ═══
 ${vocalAnalysisStr}
@@ -775,13 +801,13 @@ ${JSON.stringify(currentSettings, null, 2)}
 ═══ YOUR TASK ═══
 Critique this mix based on BOTH your listening AND the measurements:
 
-1. Vocal presence: Is the vocal clear and upfront, or buried? Check mid/presence energy.
-2. Frequency balance: Compare the mix's spectral balance to professional standards.
-3. Dynamic control: Is the crest factor appropriate? (Typically 6-10dB for mastered music)
-4. Stereo field: Is the width appropriate? Is the bass properly centered?
-5. Loudness: Is the estimated LUFS close to the target? Adjust masterGain if needed.
-6. De-essing: Is sibilance controlled?
-7. Spatial effects: Are reverb/delay appropriate? Too much = washy, too little = dry.
+1. Vocal presence: Is the vocal clear and upfront, or buried? Check mid/presence energy vs beat.
+2. Frequency balance: Any mud (200–500 Hz on vocal)? Any harshness (3–5 kHz)?
+3. Dynamic control: Crest factor ${mixAnalysis.loudness.crestFactor.toFixed(1)} dB — target 6–10 dB for mastered music.
+4. Stereo field: Width ${(mixAnalysis.stereo.width * 100).toFixed(0)}% — appropriate for ${detectedGenre}?
+5. LOUDNESS: Gap is ${lufsGap > 0 ? '+' : ''}${lufsGap.toFixed(1)} dB from target. ${Math.abs(lufsGap) > 2 ? `Adjust masterGain to close this gap.` : `Loudness is close to target.`}
+6. De-essing: Is sibilance controlled without removing vocal presence?
+7. Spatial: Reverb/delay — does the vocal sit in front of the space?
 
 Provide UPDATED settings to fix any remaining issues. Be specific about what you changed and why.
 Output JSON only.`;
@@ -820,72 +846,101 @@ Output JSON only.`;
     const masterStartTime = Date.now();
     onProgress({
       agent: 'Mastering Engineer',
-      message: 'Applying final mastering checks with loudness and spectral analysis...',
+      message: 'Rendering mix for mastering review...',
       phase: 'mastering',
     });
+
+    // Render the mix with accumulated settings so the mastering engineer can LISTEN
+    // to what they're working with, rather than deciding blind from text alone.
+    const preMasterSettings: MixSettings = deepMergeSettings(defaultMixSettings, currentSettings);
+    const preMasterBlob = await mixAudio(vocalBlob, beatBlob, backupVocalBlob, preMasterSettings);
+    const preMasterPart = await blobToGenerativePart(preMasterBlob);
+    const preMasterBuffer = await decodeBlob(preMasterBlob);
+    const preMasterAnalysis = analyzeAudio(preMasterBuffer);
+    const preMasterAnalysisStr = formatAnalysis('PRE-MASTER MIX', preMasterAnalysis);
+
+    const preMasterLufsGap = (GENRE_LUFS_TARGETS[detectedGenre] ?? -9) - preMasterAnalysis.loudness.estimatedLUFS;
+
+    onProgress({
+      agent: 'Mastering Engineer',
+      message: 'Applying final mastering decisions...',
+      details: `Pre-master mix: ${preMasterAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS, crest ${preMasterAnalysis.loudness.crestFactor.toFixed(1)} dB, stereo ${(preMasterAnalysis.stereo.width * 100).toFixed(0)}%`,
+      phase: 'mastering',
+    });
+
+    // Mastering-only schema: limits the mastering agent to mastering-chain parameters only.
+    // Using the full mixSettingsSchemaProperties here forces the agent to re-output all
+    // vocal EQ / compression values, which risks resetting the Mix Engineer's careful work.
+    const masteringOnlyProperties = {
+      stereoImaging: mixSettingsSchemaProperties.stereoImaging,
+      masterMultiband: mixSettingsSchemaProperties.masterMultiband,
+      masterEQ: mixSettingsSchemaProperties.masterEQ,
+      masterLimiter: mixSettingsSchemaProperties.masterLimiter,
+      masterGain: mixSettingsSchemaProperties.masterGain,
+      softClipAmount: mixSettingsSchemaProperties.softClipAmount,
+      lufsTarget: mixSettingsSchemaProperties.lufsTarget,
+    };
 
     const masterSchema = enforceRequired({
       type: "OBJECT",
       properties: {
         settings: {
           type: "OBJECT",
-          properties: mixSettingsSchemaProperties
+          properties: masteringOnlyProperties
         },
         masteringNotes: { type: "STRING", description: "Detailed mastering notes covering EQ, dynamics, stereo, and loudness decisions." }
       }
     });
 
-    const masterPrompt = `You are a Grammy-winning Mastering Engineer applying final polish to a mix. You have access to the full signal chain.
+    const masterPrompt = `You are a Grammy-winning Mastering Engineer. Listen to the pre-master mix and apply final mastering polish.
 
-═══ ACOUSTIC ANALYSIS ═══
-${analysisText}
+═══ PRE-MASTER MIX MEASUREMENTS ═══
+${preMasterAnalysisStr}
 
-═══ NUMERICAL MEASUREMENTS ═══
+═══ TARGET ═══
+Genre: ${detectedGenre.toUpperCase()}
+LUFS target: ${GENRE_LUFS_TARGETS[detectedGenre] ?? -9} LUFS
+Current LUFS: ${preMasterAnalysis.loudness.estimatedLUFS.toFixed(1)} LUFS
+Gap: ${preMasterLufsGap > 0 ? '+' : ''}${preMasterLufsGap.toFixed(1)} dB ${Math.abs(preMasterLufsGap) > 2 ? `⚠️ ${preMasterLufsGap > 0 ? 'increase masterGain' : 'reduce masterGain'}` : '✅ close to target'}
+
+═══ ORIGINAL SOURCE MEASUREMENTS ═══
 Vocal: RMS ${vocalAnalysis.loudness.rmsDB.toFixed(1)} dBFS, Peak ${vocalAnalysis.loudness.peakDB.toFixed(1)} dBFS
 Beat: RMS ${beatAnalysis.loudness.rmsDB.toFixed(1)} dBFS, Peak ${beatAnalysis.loudness.peakDB.toFixed(1)} dBFS
 
-═══ MIX ENGINEER'S SETTINGS ═══
-${JSON.stringify(currentSettings, null, 2)}
-
 ═══ YOUR MASTERING DECISIONS ═══
 
-As the mastering engineer, focus on these final elements:
+Listen to the pre-master mix above. Your job is ONLY to tune the mastering chain — the vocal
+EQ, compression, and spatial effects are already set by the Mix Engineer.
+
+Focus on:
 
 1. MASTER MULTIBAND COMPRESSION:
-   - Low band (<250Hz): Tighten the bass. Slower attack, moderate ratio.
-   - Mid band (250-4kHz): Glue the vocal and beat. Moderate attack and ratio.
-   - High band (>4kHz): Smooth harshness. Moderate settings.
+   - Low band (<250Hz): Tighten bass. Slower attack (0.02–0.04s), moderate ratio (1.5–2.5).
+   - Mid band (250–4kHz): Glue vocal + beat. Moderate attack (0.008–0.02s), ratio 1.5–2.0.
+   - High band (>4kHz): Smooth harshness. Fast attack (0.003–0.01s), ratio 1.5–2.0.
 
-2. MASTER EQ (Sweetening):
-   - Very subtle moves only (±2dB). This is mastering — surgical precision.
-   - Low shelf: Warmth or clarity.
-   - High shelf: Air and sparkle.
+2. MASTER EQ (Sweetening only — ±2dB max):
+   - Low shelf: Add warmth or cut mud based on what you hear.
+   - High shelf: Air/sparkle or tame harshness.
 
 3. STEREO IMAGING:
-   - Width: 1.0-1.3 (don't over-widen).
-   - Bass mono cutoff: 100-180Hz (tight, punchy bass).
+   - Width 1.0–1.3 (appropriate for ${detectedGenre}).
+   - Bass mono cutoff 100–160Hz for tight low end.
 
-4. SOFT CLIPPER: Shave 1-3dB of transient peaks before the limiter (0.1-0.3).
+4. SOFT CLIPPER: 0.1–0.3 to shave transient peaks before limiter.
 
-5. LIMITER:
-   - Ceiling: -1.0 dBTP (streaming safe).
-   - Release: Fast enough to be transparent (0.03-0.08s).
+5. LIMITER: Ceiling -1.0 dBTP, release 0.03–0.08s for transparency.
 
-6. LUFS TARGET: Choose genre-appropriate loudness.
-   - Hip-hop/Pop: -8 to -10 LUFS
-   - Electronic: -7 to -9 LUFS
-   - Acoustic: -11 to -14 LUFS
+6. LUFS TARGET: Set to ${GENRE_LUFS_TARGETS[detectedGenre] ?? -9} LUFS.
+   Adjust masterGain to compensate for the ${Math.abs(preMasterLufsGap).toFixed(1)} dB gap.
 
-7. MASTER GAIN: Adjust to drive the limiter appropriately.
-
-CRITICAL: Do NOT over-process. Mastering is about polish, not surgery.
-The mix engineer has already done most of the heavy lifting.
-Your job is to ensure commercial-ready loudness, tonal balance, and stereo coherence.
+CRITICAL: Do NOT over-process. The mix engineer did the heavy lifting.
+Mastering is final polish — coherence, loudness, and subtle tonal balance.
 
 Output JSON only.`;
 
     const masterResponse = await generateContentWithCycle(ai, {
-      contents: [{ text: masterPrompt }],
+      contents: [{ text: masterPrompt }, preMasterPart],
       config: {
         responseMimeType: "application/json",
         responseSchema: masterSchema as any,
@@ -893,7 +948,13 @@ Output JSON only.`;
     });
 
     const finalResult = parseSafeJSON(masterResponse.text || "{}");
-    const finalSettings = deepMergeSettings(defaultMixSettings, finalResult.settings);
+    // Merge mastering agent output ON TOP of accumulated Mix/Review Engineer settings.
+    // Previously this used defaultMixSettings as the base, which discarded all the
+    // Mix Engineer and Review Engineer's carefully tuned vocal chain parameters.
+    const finalSettings = deepMergeSettings(
+      deepMergeSettings(defaultMixSettings, currentSettings),
+      finalResult.settings
+    );
 
     onProgress({
       agent: 'Mastering Engineer',
